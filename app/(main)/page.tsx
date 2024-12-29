@@ -17,24 +17,34 @@ function removeCodeFormatting(code: string): string {
 
 export default function Home() {
   let [status, setStatus] = useState<
-    "initial" | "creating" | "created" | "updating" | "updated"
+    "initial" | "creating" | "created" | "updating" | "updated" | "error"
   >("initial");
+  let [error, setError] = useState<string>("");
   let [prompt, setPrompt] = useState("");
-  let models = [
-    {
-      label: "gemini-2.0-flash-exp",
-      value: "gemini-2.0-flash-exp",
-    },
-    {
-      label: "gemini-1.5-pro",
-      value: "gemini-1.5-pro",
-    },
-    {
-      label: "gemini-1.5-flash",
-      value: "gemini-1.5-flash",
-    }
-  ];
-  let [model, setModel] = useState(models[0].value);
+  let [provider, setProvider] = useState<"gemini" | "groq">("gemini");
+  let models = {
+    gemini: [
+      {
+        label: "gemini-2.0-flash-exp",
+        value: "gemini-2.0-flash-exp",
+      },
+      {
+        label: "gemini-1.5-pro",
+        value: "gemini-1.5-pro",
+      },
+      {
+        label: "gemini-1.5-flash",
+        value: "gemini-1.5-flash",
+      }
+    ],
+    groq: [
+      {
+        label: "mixtral-8x7b-32768",
+        value: "mixtral-8x7b-32768",
+      }
+    ]
+  };
+  let [model, setModel] = useState(models.gemini[0].value);
   let [shadcn, setShadcn] = useState(false);
   let [modification, setModification] = useState("");
   let [generatedCode, setGeneratedCode] = useState("");
@@ -49,6 +59,11 @@ export default function Home() {
 
   let loading = status === "creating" || status === "updating";
 
+  // Update model when provider changes
+  useEffect(() => {
+    setModel(models[provider][0].value);
+  }, [provider]);
+
   async function createApp(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
 
@@ -57,44 +72,64 @@ export default function Home() {
     }
 
     setStatus("creating");
+    setError("");
     setGeneratedCode("");
 
-    let res = await fetch("/api/generateCode", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        shadcn,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
+    try {
+      let res = await fetch("/api/generateCode", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          provider,
+          shadcn,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
 
-    if (!res.ok) {
-      throw new Error(res.statusText);
-    }
-
-    if (!res.body) {
-      throw new Error("No response body");
-    }
-
-    const reader = res.body.getReader();
-    let receivedData = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
+      if (!res.ok) {
+        const errorText = await res.text();
+        try {
+          const errorJson = JSON.parse(errorText);
+          throw new Error(errorJson.error || res.statusText);
+        } catch {
+          throw new Error(errorText || res.statusText);
+        }
       }
-      receivedData += new TextDecoder().decode(value);
-      const cleanedData = removeCodeFormatting(receivedData);
-      setGeneratedCode(cleanedData);
-    }
 
-    setMessages([{ role: "user", content: prompt }]);
-    setInitialAppConfig({ model, shadcn });
-    setStatus("created");
+      if (!res.body) {
+        throw new Error("No response body");
+      }
+
+      const reader = res.body.getReader();
+      let receivedData = "";
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          const text = new TextDecoder().decode(value);
+          receivedData += text;
+          const cleanedData = removeCodeFormatting(receivedData);
+          setGeneratedCode(cleanedData);
+        }
+
+        setMessages([{ role: "user", content: prompt }]);
+        setInitialAppConfig({ model, shadcn });
+        setStatus("created");
+      } catch (error) {
+        throw new Error("Error reading stream: " + (error as Error).message);
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (error) {
+      console.error("Error generating code:", error);
+      setError((error as Error).message);
+      setStatus("error");
+    }
   }
 
   useEffect(() => {
@@ -109,17 +144,23 @@ export default function Home() {
     <main className="mt-12 flex w-full flex-1 flex-col items-center px-4 text-center sm:mt-1">
       <a
         className="mb-4 inline-flex h-7 shrink-0 items-center gap-[9px] rounded-[50px] border-[0.5px] border-solid border-[#E6E6E6] bg-[rgba(234,238,255,0.65)] bg-gray-100 px-7 py-5 shadow-[0px_1px_1px_0px_rgba(0,0,0,0.25)]"
-        href="https://ai.google.dev/gemini-api/docs"
+        href={provider === "gemini" ? "https://ai.google.dev/gemini-api/docs" : "https://console.groq.com/docs"}
         target="_blank"
       >
         <span className="text-center">
-          Powered by <span className="font-medium">Gemini API</span>
+          Powered by <span className="font-medium">{provider === "gemini" ? "Gemini API" : "Groq API"}</span>
         </span>
       </a>
       <h1 className="my-6 max-w-3xl text-4xl font-bold text-gray-800 sm:text-6xl">
         Turn your <span className="text-blue-600">idea</span>
         <br /> into an <span className="text-blue-600">app</span>
       </h1>
+
+      {error && (
+        <div className="mb-6 w-full max-w-xl rounded-lg bg-red-100 p-4 text-red-700">
+          {error}
+        </div>
+      )}
 
       <form className="w-full max-w-xl" onSubmit={createApp}>
         <fieldset disabled={loading} className="disabled:opacity-75">
@@ -151,6 +192,59 @@ export default function Home() {
             </div>
           </div>
           <div className="mt-6 flex flex-col justify-center gap-4 sm:flex-row sm:items-center sm:gap-8">
+            {/* Provider Selection */}
+            <div className="flex items-center justify-between gap-3 sm:justify-center">
+              <p className="text-gray-500 sm:text-xs">Provider:</p>
+              <Select.Root
+                name="provider"
+                disabled={loading}
+                value={provider}
+                onValueChange={(value: "gemini" | "groq") => setProvider(value)}
+              >
+                <Select.Trigger className="group flex w-40 max-w-xs items-center rounded-2xl border-[6px] border-gray-300 bg-white px-4 py-2 text-sm focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500">
+                  <Select.Value />
+                  <Select.Icon className="ml-auto">
+                    <ChevronDownIcon className="size-6 text-gray-300 group-focus-visible:text-gray-500 group-enabled:group-hover:text-gray-500" />
+                  </Select.Icon>
+                </Select.Trigger>
+                <Select.Portal>
+                  <Select.Content className="overflow-hidden rounded-md bg-white shadow-lg">
+                    <Select.Viewport className="p-2">
+                      <Select.Item
+                        value="gemini"
+                        className="flex cursor-pointer items-center rounded-md px-3 py-2 text-sm data-[highlighted]:bg-gray-100 data-[highlighted]:outline-none"
+                      >
+                        <Select.ItemText asChild>
+                          <span className="inline-flex items-center gap-2 text-gray-500">
+                            <div className="size-2 rounded-full bg-green-500" />
+                            Gemini
+                          </span>
+                        </Select.ItemText>
+                        <Select.ItemIndicator className="ml-auto">
+                          <CheckIcon className="size-5 text-blue-600" />
+                        </Select.ItemIndicator>
+                      </Select.Item>
+                      <Select.Item
+                        value="groq"
+                        className="flex cursor-pointer items-center rounded-md px-3 py-2 text-sm data-[highlighted]:bg-gray-100 data-[highlighted]:outline-none"
+                      >
+                        <Select.ItemText asChild>
+                          <span className="inline-flex items-center gap-2 text-gray-500">
+                            <div className="size-2 rounded-full bg-purple-500" />
+                            Groq
+                          </span>
+                        </Select.ItemText>
+                        <Select.ItemIndicator className="ml-auto">
+                          <CheckIcon className="size-5 text-blue-600" />
+                        </Select.ItemIndicator>
+                      </Select.Item>
+                    </Select.Viewport>
+                  </Select.Content>
+                </Select.Portal>
+              </Select.Root>
+            </div>
+
+            {/* Model Selection */}
             <div className="flex items-center justify-between gap-3 sm:justify-center">
               <p className="text-gray-500 sm:text-xs">Model:</p>
               <Select.Root
@@ -168,7 +262,7 @@ export default function Home() {
                 <Select.Portal>
                   <Select.Content className="overflow-hidden rounded-md bg-white shadow-lg">
                     <Select.Viewport className="p-2">
-                      {models.map((model) => (
+                      {models[provider].map((model) => (
                         <Select.Item
                           key={model.value}
                           value={model.value}
@@ -186,17 +280,13 @@ export default function Home() {
                         </Select.Item>
                       ))}
                     </Select.Viewport>
-                    <Select.ScrollDownButton />
-                    <Select.Arrow />
                   </Select.Content>
                 </Select.Portal>
               </Select.Root>
             </div>
 
             <div className="flex h-full items-center justify-between gap-3 sm:justify-center">
-              <label className="text-gray-500 sm:text-xs" htmlFor="shadcn">
-                shadcn/ui:
-              </label>
+              <p className="text-gray-500 sm:text-xs">Use shadcn/ui:</p>
               <Switch.Root
                 className="group flex w-20 max-w-xs items-center rounded-2xl border-[6px] border-gray-300 bg-white p-1.5 text-sm shadow-inner transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-500 data-[state=checked]:bg-blue-500"
                 id="shadcn"
@@ -213,7 +303,7 @@ export default function Home() {
 
       <hr className="border-1 mb-20 h-px bg-gray-700 dark:bg-gray-700" />
 
-      {status !== "initial" && (
+      {(status !== "initial" || error) && (
         <motion.div
           initial={{ height: 0 }}
           animate={{
@@ -263,6 +353,5 @@ export default function Home() {
 async function minDelay<T>(promise: Promise<T>, ms: number) {
   let delay = new Promise((resolve) => setTimeout(resolve, ms));
   let [p] = await Promise.all([promise, delay]);
-
   return p;
 }

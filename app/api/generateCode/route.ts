@@ -4,6 +4,7 @@ import { z } from "zod";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const apiKey = process.env.GOOGLE_AI_API_KEY || "";
+const groqApiKey = process.env.GROQ_API_KEY || "";
 const genAI = new GoogleGenerativeAI(apiKey);
 
 export async function POST(req: Request) {
@@ -11,6 +12,7 @@ export async function POST(req: Request) {
   let result = z
     .object({
       model: z.string(),
+      provider: z.enum(["gemini", "groq"]).default("gemini"),
       shadcn: z.boolean().default(false),
       messages: z.array(
         z.object({
@@ -21,32 +23,123 @@ export async function POST(req: Request) {
     })
     .safeParse(json);
 
-  if (result.error) {
+  if (!result.success) {
     return new Response(result.error.message, { status: 422 });
   }
 
-  let { model, messages, shadcn } = result.data;
+  let { model, provider, messages, shadcn } = result.data;
   let systemPrompt = getSystemPrompt(shadcn);
+  const prompt = messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with ```typescript or ```javascript or ```tsx or ```."
 
-  const geminiModel = genAI.getGenerativeModel({model: model});
+  if (provider === "gemini") {
+    const geminiModel = genAI.getGenerativeModel({model: model});
+    const geminiStream = await geminiModel.generateContentStream(prompt);
 
-  const geminiStream = await geminiModel.generateContentStream(
-    messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with \`\`\`typescript or \`\`\`javascript or \`\`\`tsx or \`\`\`."
-  );
+    const readableStream = new ReadableStream({
+      async start(controller) {
+        for await (const chunk of geminiStream.stream) {
+          const chunkText = chunk.text();
+          controller.enqueue(new TextEncoder().encode(chunkText));
+        }
+        controller.close();
+      },
+    });
 
-  console.log(messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with \`\`\`typescript or \`\`\`javascript or \`\`\`tsx or \`\`\`.")
+    return new Response(readableStream);
+  } else if (provider === "groq") {
+    if (!groqApiKey) {
+      return new Response("GROQ_API_KEY not configured", { status: 500 });
+    }
 
-  const readableStream = new ReadableStream({
-    async start(controller) {
-      for await (const chunk of geminiStream.stream) {
-        const chunkText = chunk.text();
-        controller.enqueue(new TextEncoder().encode(chunkText));
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + groqApiKey,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+      },
+      body: JSON.stringify({
+        model: "mixtral-8x7b-32768",
+        messages: [
+          {
+            role: "system",
+            content: "You are a React code generator. You MUST follow these rules:\n" +
+                    "1. Output ONLY TypeScript React code\n" +
+                    "2. Start with import statements\n" +
+                    "3. NO explanations, NO comments, NO text before or after the code\n" +
+                    "4. First line MUST be an import statement\n" +
+                    "5. NO acknowledgments or explanations\n" +
+                    "6. If you want to explain something, do it in code comments\n" +
+                    "7. NEVER start with phrases like 'Here's the code' or 'I understand'\n" +
+                    "8. Start DIRECTLY with 'import'"
+          },
+          { 
+            role: "user", 
+            content: messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with ```typescript or ```javascript or ```tsx or ```."
+          }
+        ],
+        temperature: 0.7,
+        stream: true,
+        max_tokens: 4000,
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      return new Response(error, { status: response.status });
+    }
+
+    let buffer = '';
+    let hasStartedCode = false;
+    const transformStream = new TransformStream({
+      async transform(chunk, controller) {
+        const text = new TextDecoder().decode(chunk);
+        buffer += text;
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.trim() === '') continue;
+          if (line.trim() === 'data: [DONE]') continue;
+          
+          if (line.startsWith('data: ')) {
+            try {
+              const data = line.slice(6);
+              const json = JSON.parse(data);
+              let content = json.choices[0]?.delta?.content;
+              
+              if (content) {
+                // Skip any content before the first import statement
+                if (!hasStartedCode) {
+                  const importIndex = content.indexOf('import');
+                  if (importIndex !== -1) {
+                    hasStartedCode = true;
+                    content = content.slice(importIndex);
+                  } else {
+                    continue;
+                  }
+                }
+                
+                // Skip any explanatory text that might appear
+                if (content.toLowerCase().includes("here's") || 
+                    content.toLowerCase().includes("understand") ||
+                    content.toLowerCase().includes("create") ||
+                    content.toLowerCase().includes("following")) {
+                  continue;
+                }
+                
+                controller.enqueue(new TextEncoder().encode(content));
+              }
+            } catch (e) {
+              continue;
+            }
+          }
+        }
       }
-      controller.close();
-    },
-  });
+    });
 
-  return new Response(readableStream);
+    return new Response(response.body?.pipeThrough(transformStream));
+  }
 }
 
 function getSystemPrompt(shadcn: boolean) {
@@ -63,11 +156,7 @@ function getSystemPrompt(shadcn: boolean) {
 - Please ONLY return the full React code starting with the imports, nothing else. It's very important for my job that you only return the React code with imports. DO NOT START WITH \`\`\`typescript or \`\`\`javascript or \`\`\`tsx or \`\`\`.
 - ONLY IF the user asks for a dashboard, graph or chart, the recharts library is available to be imported, e.g. \`import { LineChart, XAxis, ... } from "recharts"\` & \`<LineChart ...><XAxis dataKey="name"> ...\`. Please only use this when needed.
 - For placeholder images, please use a <div className="bg-gray-200 border-2 border-dashed rounded-xl w-16 h-16" />
-  `;
-
-  // - The lucide-react library is also available to be imported IF NECCESARY ONLY FOR THE FOLLOWING ICONS: Heart, Shield, Clock, Users, Play, Home, Search, Menu, User, Settings, Mail, Bell, Calendar, Clock, Heart, Star, Upload, Download, Trash, Edit, Plus, Minus, Check, X, ArrowRight.
-  // - Here's an example of importing and using one: import { Heart } from "lucide-react"\` & \`<Heart className=""  />\`.
-  // - PLEASE ONLY USE THE ICONS LISTED ABOVE IF AN ICON IS NEEDED IN THE USER'S REQUEST. Please DO NOT use the lucide-react library if it's not needed.
+`;
 
   if (shadcn) {
     systemPrompt += `
@@ -98,10 +187,6 @@ function getSystemPrompt(shadcn: boolean) {
   systemPrompt += `
     NO OTHER LIBRARIES (e.g. zod, hookform) ARE INSTALLED OR ABLE TO BE IMPORTED.
   `;
-
-  console.log("Here is the system prompt");
-  console.log(systemPrompt);
-
 
   return dedent(systemPrompt);
 }
