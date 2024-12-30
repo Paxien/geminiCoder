@@ -11,14 +11,19 @@ export async function POST(req: Request) {
   let json = await req.json();
   let result = z
     .object({
-      model: z.string(),
+      model: z.string().optional(),
       provider: z.enum(["gemini", "groq"]).default("gemini"),
+      groqModel: z.enum([
+        "mixtral-8x7b-32768",
+        "llama3-70b-8192",
+        "llama3-8b-8192"
+      ] as const).optional(),
       shadcn: z.boolean().default(false),
       messages: z.array(
         z.object({
           role: z.enum(["user", "assistant"]),
           content: z.string(),
-        }),
+        })
       ),
     })
     .safeParse(json);
@@ -27,25 +32,34 @@ export async function POST(req: Request) {
     return new Response(result.error.message, { status: 422 });
   }
 
-  let { model, provider, messages, shadcn } = result.data;
+  const { provider, groqModel, messages, shadcn } = result.data;
   let systemPrompt = getSystemPrompt(shadcn);
-  const prompt = messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with ```typescript or ```javascript or ```tsx or ```."
 
   if (provider === "gemini") {
-    const geminiModel = genAI.getGenerativeModel({model: model});
-    const geminiStream = await geminiModel.generateContentStream(prompt);
+    if (!result.data.model) {
+      return new Response("Model is required for Gemini", { status: 422 });
+    }
+    const geminiModel = genAI.getGenerativeModel({ model: result.data.model });
+    const geminiStream = await geminiModel.generateContentStream(
+      messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with \`\`\`typescript or \`\`\`javascript or \`\`\`tsx or \`\`\`."
+    );
 
-    const readableStream = new ReadableStream({
-      async start(controller) {
-        for await (const chunk of geminiStream.stream) {
-          const chunkText = chunk.text();
-          controller.enqueue(new TextEncoder().encode(chunkText));
-        }
-        controller.close();
-      },
-    });
-
-    return new Response(readableStream);
+    return new Response(
+      new ReadableStream({
+        async start(controller) {
+          try {
+            for await (const chunk of geminiStream.stream) {
+              const chunkText = chunk.text();
+              controller.enqueue(new TextEncoder().encode(chunkText));
+            }
+          } catch (error) {
+            controller.error(error);
+          } finally {
+            controller.close();
+          }
+        },
+      })
+    );
   } else if (provider === "groq") {
     if (!groqApiKey) {
       return new Response("GROQ_API_KEY not configured", { status: 500 });
@@ -54,109 +68,143 @@ export async function POST(req: Request) {
     const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": "Bearer " + groqApiKey,
+        "Authorization": `Bearer ${groqApiKey}`,
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
       },
       body: JSON.stringify({
-        model: "mixtral-8x7b-32768",
+        model: groqModel,
         messages: [
-          {
-            role: "system",
-            content: "You are a React code generator. You MUST follow these rules:\n" +
-                    "1. Output ONLY TypeScript React code\n" +
-                    "2. Start with import statements\n" +
-                    "3. NO explanations, NO comments, NO text before or after the code\n" +
-                    "4. First line MUST be an import statement\n" +
-                    "5. NO acknowledgments or explanations\n" +
-                    "6. If you want to explain something, do it in code comments\n" +
-                    "7. NEVER start with phrases like 'Here's the code' or 'I understand'\n" +
-                    "8. Start DIRECTLY with 'import'"
+          { 
+            role: "system", 
+            content: systemPrompt
           },
           { 
             role: "user", 
-            content: messages[0].content + systemPrompt + "\nPlease ONLY return code, NO backticks or language names. Don't start with ```typescript or ```javascript or ```tsx or ```."
+            content: messages[0].content
           }
         ],
-        temperature: 0.7,
-        stream: true,
-        max_tokens: 4000,
+        temperature: 0.1,
+        stream: false,
       }),
     });
 
     if (!response.ok) {
-      const error = await response.text();
-      return new Response(error, { status: response.status });
+      return new Response(await response.text(), { status: response.status });
     }
 
-    let buffer = '';
-    let hasStartedCode = false;
-    const transformStream = new TransformStream({
-      async transform(chunk, controller) {
-        const text = new TextDecoder().decode(chunk);
-        buffer += text;
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+    const result = await response.json();
+    let content = result.choices[0].message.content;
 
-        for (const line of lines) {
-          if (line.trim() === '') continue;
-          if (line.trim() === 'data: [DONE]') continue;
-          
-          if (line.startsWith('data: ')) {
-            try {
-              const data = line.slice(6);
-              const json = JSON.parse(data);
-              let content = json.choices[0]?.delta?.content;
-              
-              if (content) {
-                // Skip any content before the first import statement
-                if (!hasStartedCode) {
-                  const importIndex = content.indexOf('import');
-                  if (importIndex !== -1) {
-                    hasStartedCode = true;
-                    content = content.slice(importIndex);
-                  } else {
-                    continue;
-                  }
-                }
-                
-                // Skip any explanatory text that might appear
-                if (content.toLowerCase().includes("here's") || 
-                    content.toLowerCase().includes("understand") ||
-                    content.toLowerCase().includes("create") ||
-                    content.toLowerCase().includes("following")) {
-                  continue;
-                }
-                
-                controller.enqueue(new TextEncoder().encode(content));
-              }
-            } catch (e) {
-              continue;
-            }
-          }
+    // Clean the content
+    content = content
+      .replace(/```(typescript|tsx|javascript|jsx)?/g, '')
+      .replace(/```/g, '')
+      .replace(/^.*?Here is.*?\n/g, '')
+      .replace(/^.*?This component.*?\n/g, '')
+      .replace(/^.*?I'll create.*?\n/g, '')
+      .replace(/^.*?is a simple React.*?\n/g, '')
+      .trim();
+
+    // Model-specific processing
+    if (provider === "groq" && groqModel?.includes('llama')) {
+      // Fix common Llama issues
+      content = content
+        // Fix missing spaces after import
+        .replace(/import(\w+)/g, 'import $1')
+        .replace(/from(\w+)/g, 'from $1')
+        // Fix spaces in JSX
+        .replace(/className=(\w+)/g, 'className="$1"')
+        // Fix missing spaces in function declarations
+        .replace(/function(\w+)/g, 'function $1')
+        // Fix missing spaces in arrow functions
+        .replace(/\)=>/g, ') =>')
+        // Fix missing spaces in object properties
+        .replace(/,(\w+):/g, ', $1:')
+        // Fix missing spaces after commas
+        .replace(/,(\w+)/g, ', $1')
+        // Fix missing spaces in type declarations
+        .replace(/:(\w+)=/g, ': $1 =')
+        // Remove any duplicate imports
+        .replace(/(import React.*?\n)[\s\S]*?(import React.*?\n)/g, '$1')
+        // Fix missing quotes in imports
+        .replace(/from ([^'"][^;\n]+)/g, "from '$1'");
+    }
+
+    // Ensure proper imports and exports
+    if (!content.startsWith('import React')) {
+      content = 'import React, { useState } from \'react\';\n' + content;
+    }
+
+    if (!content.includes('export default')) {
+      // Extract the component name and wrap it in export default
+      const componentMatch = content.match(/function\s+(\w+)/);
+      if (componentMatch) {
+        const componentName = componentMatch[1];
+        content = content.replace(
+          new RegExp(`function\\s+${componentName}`),
+          'export default function ' + componentName
+        );
+      }
+    }
+
+    // Final cleanup
+    content = content
+      // Remove any empty lines at start/end
+      .trim()
+      // Ensure single newline after imports
+      .replace(/;\n+/g, ';\n')
+      // Fix any remaining formatting issues
+      .replace(/\s+/g, ' ')
+      .replace(/> </g, '>\n<')
+      .replace(/; /g, ';\n')
+      .replace(/{ /g, '{\n  ')
+      .replace(/ }/g, '\n}')
+      .replace(/\( /g, '(')
+      .replace(/ \)/g, ')')
+      .replace(/ = /g, ' = ');
+
+    // Create a readable stream with the processed content
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(content));
+          controller.close();
+        }
+      }),
+      {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
         }
       }
-    });
-
-    return new Response(response.body?.pipeThrough(transformStream));
+    );
   }
 }
 
 function getSystemPrompt(shadcn: boolean) {
-  let systemPrompt = 
-`You are an expert frontend React engineer who is also a great UI/UX designer. Follow the instructions carefully, I will tip you $1 million if you do a good job:
+  let systemPrompt = `You are an expert frontend React engineer who is also a great UI/UX designer. Follow these rules EXACTLY:
 
-- Think carefully step by step.
-- Create a React component for whatever the user asked you to create and make sure it can run by itself by using a default export
-- Make sure the React app is interactive and functional by creating state when needed and having no required props
-- If you use any imports from React like useState or useEffect, make sure to import them directly
-- Use TypeScript as the language for the React component
-- Use Tailwind classes for styling. DO NOT USE ARBITRARY VALUES (e.g. \`h-[600px]\`). Make sure to use a consistent color palette.
-- Use Tailwind margin and padding classes to style the components and ensure the components are spaced out nicely
-- Please ONLY return the full React code starting with the imports, nothing else. It's very important for my job that you only return the React code with imports. DO NOT START WITH \`\`\`typescript or \`\`\`javascript or \`\`\`tsx or \`\`\`.
-- ONLY IF the user asks for a dashboard, graph or chart, the recharts library is available to be imported, e.g. \`import { LineChart, XAxis, ... } from "recharts"\` & \`<LineChart ...><XAxis dataKey="name"> ...\`. Please only use this when needed.
-- For placeholder images, please use a <div className="bg-gray-200 border-2 border-dashed rounded-xl w-16 h-16" />
-`;
+1. Start with EXACTLY this import: import React, { useState } from 'react';
+2. Use EXACTLY this component format:
+   export default function ComponentName() {
+     // state and functions here
+     return (
+       // JSX here
+     );
+   }
+3. NO const Component = () => {} syntax
+4. NO arrow functions for the main component
+5. NO named exports, ONLY default export
+6. Use TypeScript types when needed
+7. Use ONLY Tailwind classes for styling
+8. Create interactive components with proper state management
+9. NO comments or explanations in the code
+10. NO text before or after the code
+11. NO markdown formatting
+12. NO arbitrary Tailwind values (e.g. h-[600px])
+13. Use proper spacing and indentation
+14. For placeholder images, use: <div className="bg-gray-200 border-2 border-dashed rounded-xl w-16 h-16" />
+15. ONLY use libraries explicitly mentioned (recharts for charts only)`;
 
   if (shadcn) {
     systemPrompt += `

@@ -8,7 +8,7 @@ import { ArrowUpOnSquareIcon } from "@heroicons/react/24/outline";
 import * as Select from "@radix-ui/react-select";
 import * as Switch from "@radix-ui/react-switch";
 import { AnimatePresence, motion } from "framer-motion";
-import { FormEvent, useEffect, useState } from "react";
+import React, { FormEvent, useEffect, useMemo, useState } from "react";
 import LoadingDots from "../../components/loading-dots";
 
 function removeCodeFormatting(code: string): string {
@@ -39,8 +39,44 @@ export default function Home() {
     ],
     groq: [
       {
-        label: "mixtral-8x7b-32768",
+        label: "Mixtral 8x7B (32K context)",
         value: "mixtral-8x7b-32768",
+      },
+      {
+        label: "LLaMA3 Groq 70B (Tool Use)",
+        value: "llama3-groq-70b-8192-tool-use-preview",
+      },
+      {
+        label: "Gemma 2 9B",
+        value: "gemma2-9b-it",
+      },
+      {
+        label: "LLaMA3 70B",
+        value: "llama3-70b-8192",
+      },
+      {
+        label: "LLaMA3 8B",
+        value: "llama3-8b-8192",
+      },
+      {
+        label: "LLaMA 3.2 11B",
+        value: "llama-3.2-11b-text-preview",
+      },
+      {
+        label: "LLaMA 3.1 70B Versatile",
+        value: "llama-3.1-70b-versatile",
+      },
+      {
+        label: "Gemma 7B",
+        value: "gemma-7b-it",
+      },
+      {
+        label: "LLaMA3 Groq 8B (Tool Use)",
+        value: "llama3-groq-8b-8192-tool-use-preview",
+      },
+      {
+        label: "LLaMA 3.1 8B Instant",
+        value: "llama-3.1-8b-instant",
       }
     ]
   };
@@ -48,6 +84,7 @@ export default function Home() {
   let [shadcn, setShadcn] = useState(false);
   let [modification, setModification] = useState("");
   let [generatedCode, setGeneratedCode] = useState("");
+  let [processedCode, setProcessedCode] = useState("");
   let [initialAppConfig, setInitialAppConfig] = useState({
     model: "",
     shadcn: true,
@@ -59,9 +96,130 @@ export default function Home() {
 
   let loading = status === "creating" || status === "updating";
 
+  useEffect(() => {
+    if (!generatedCode) return;
+    
+    // Process the code before setting it
+    const cleanCode = generatedCode
+      .replace(/```(typescript|tsx|javascript|jsx)?/g, '')
+      .replace(/```/g, '')
+      .trim();
+
+    // Ensure it has proper structure
+    let finalCode = cleanCode;
+    if (!finalCode.startsWith('import React')) {
+      finalCode = 'import React, { useState } from \'react\';\n' + finalCode;
+    }
+
+    if (!finalCode.includes('export default')) {
+      const componentMatch = finalCode.match(/function\s+(\w+)/);
+      if (componentMatch) {
+        const componentName = componentMatch[1];
+        finalCode = finalCode.replace(
+          new RegExp(`function\\s+${componentName}`),
+          'export default function ' + componentName
+        );
+      }
+    }
+
+    // Clean up any formatting issues
+    finalCode = finalCode
+      .replace(/\s+/g, ' ')
+      .replace(/> </g, '>\n<')
+      .replace(/; /g, ';\n')
+      .replace(/{ /g, '{\n  ')
+      .replace(/ }/g, '\n}')
+      .replace(/\( /g, '(')
+      .replace(/ \)/g, ')')
+      .replace(/ = /g, ' = ')
+      .trim();
+
+    setProcessedCode(finalCode);
+  }, [generatedCode]);
+
+  // Wrapper function to handle JSX compilation
+  function createComponent(code: string) {
+    try {
+      // Only process if we have a complete component
+      if (!code.includes('export default') || !code.includes('return')) {
+        return null;
+      }
+
+      // Remove imports and exports
+      const cleanCode = code
+        .replace(/import\s+React,\s*{\s*useState\s*}\s*from\s*['"]react['"];?\n?/, '')
+        .replace(/import\s+{\s*([^}]+)\s*}\s*from\s*['"][^'"]+['"];?\n?/g, '')
+        .replace(/import\s+(\w+)\s*from\s*['"][^'"]+['"];?\n?/g, '')
+        .replace(/export\s+default\s+/, '')
+        .trim();
+
+      // Extract the component name and body
+      const functionMatch = cleanCode.match(/function\s+(\w+)\s*\([^)]*\)\s*{([\s\S]*)}/);
+      if (!functionMatch) return null;
+
+      const [_, componentName, componentBody] = functionMatch;
+      
+      // Create a proper React component
+      return (React: typeof import('react'), useState: typeof import('react').useState) => {
+        try {
+          // Create the component function
+          const ComponentFunction = new Function(
+            'React', 
+            'useState', 
+            `
+            return function ${componentName}(props) {
+              const useState = arguments[1];
+              ${componentBody}
+            }
+            `
+          )(React, useState);
+
+          // Ensure it's a valid component
+          ComponentFunction.displayName = componentName;
+          return ComponentFunction;
+        } catch (error) {
+          return null;
+        }
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  const PreviewComponent = useMemo(() => {
+    if (!processedCode) return null;
+    
+    try {
+      const factory = createComponent(processedCode);
+      if (!factory) return null;
+
+      const Component = factory(React, useState);
+      if (!Component) return null;
+
+      return Component;
+    } catch (error) {
+      return null;
+    }
+  }, [processedCode]);
+
+  const LivePreview = useMemo(() => {
+    try {
+      if (!PreviewComponent) {
+        return null;
+      }
+      return React.createElement(PreviewComponent);
+    } catch (error) {
+      return null;
+    }
+  }, [PreviewComponent]);
+
   // Update model when provider changes
   useEffect(() => {
-    setModel(models[provider][0].value);
+    if (provider === "groq" && !models.groq.find(m => m.value === model)) {
+      setModel(models.groq[0].value);
+    } else if (provider === "gemini" && !models.gemini.find(m => m.value === model)) {
+      setModel(models.gemini[0].value);
+    }
   }, [provider]);
 
   async function createApp(e: FormEvent<HTMLFormElement>) {
@@ -82,8 +240,9 @@ export default function Home() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model,
+          model: provider === "gemini" ? model : undefined,
           provider,
+          groqModel: provider === "groq" ? model : undefined,
           shadcn,
           messages: [{ role: "user", content: prompt }],
         }),
@@ -113,8 +272,19 @@ export default function Home() {
           
           const text = new TextDecoder().decode(value);
           receivedData += text;
-          const cleanedData = removeCodeFormatting(receivedData);
-          setGeneratedCode(cleanedData);
+          
+          // Only update code when we have a complete component
+          if (receivedData.includes('import') && receivedData.includes('export default')) {
+            const cleanedData = removeCodeFormatting(receivedData)
+              .replace(/```(typescript|tsx|javascript|jsx)?/g, '')
+              .replace(/```/g, '')
+              .replace(/Here is.*?\n/g, '')
+              .replace(/This component.*?\n/g, '')
+              .replace(/I'll create.*?\n/g, '')
+              .trim();
+            
+            setGeneratedCode(cleanedData);
+          }
         }
 
         setMessages([{ role: "user", content: prompt }]);
@@ -139,6 +309,15 @@ export default function Home() {
       el.scrollTo({ top: end });
     }
   }, [loading, generatedCode]);
+
+  useEffect(() => {
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    return () => {
+      buffer = '';
+    };
+  }, []);
 
   return (
     <main className="mt-12 flex w-full flex-1 flex-col items-center px-4 text-center sm:mt-1">
@@ -318,7 +497,7 @@ export default function Home() {
         >
           <div className="relative mt-8 w-full overflow-hidden">
             <div className="isolate">
-              <CodeViewer code={generatedCode} showEditor />
+              <CodeViewer code={processedCode} showEditor />
             </div>
 
             <AnimatePresence>
@@ -343,6 +522,7 @@ export default function Home() {
                 </motion.div>
               )}
             </AnimatePresence>
+            {LivePreview}
           </div>
         </motion.div>
       )}
